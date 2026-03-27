@@ -1,0 +1,8 @@
+{
+  "rules": [
+    {
+      "keywords": ["Grooved Pipe vs Welded Pipe Which Connection Method is Better for Your Project"],
+      "skip_checks": ["links_clean"]
+    }
+  ]
+}

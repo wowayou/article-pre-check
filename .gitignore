@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Sensitive Data / Project Specifics
+# 敏感数据脱敏 - 忽略域名映射表和临时日志
+域名映射*.xlsx
+domain_map*.xlsx
+*.log
+
+# Sandbox Outputs (防止循环打包或提交大量测试数据)
+*_Cleaned_Output/
+Delivery_*/
+SEO审计修复报告*.xlsx
+maintenance manual.md

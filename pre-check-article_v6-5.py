@@ -1,13 +1,18 @@
 import re
+import os
+import shutil
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Any, Dict, Set
 import pandas as pd
 from docx import Document
 from docx.oxml.ns import qn
 import logging
+import json
+import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ==========================================
 # 核心数据类 (Dataclass): 规范输出数据结构
@@ -35,7 +40,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 class SEOSuperEngineV65:
     """企业级 Word 文档 SEO 自动化审查与修复引擎"""
     
-    def __init__(self, file_path: Path, target_domain: Optional[str], folder_files: List[str], config: dict):
+    def __init__(self, file_path: Path, target_domain: Optional[str], folder_files: List[str], config: Dict[str, Any]):
         self.file_path = file_path
         self.doc = Document(self.file_path)
         self.folder_files = folder_files
@@ -46,6 +51,7 @@ class SEOSuperEngineV65:
         self.changes = []
         self.missing_images = []
         self.links_removed_count = 0
+        self.external_links_found = 0  # [Bug 3] 记录是否真实存在外链
         self.all_links_found = set()
 
     def _normalize_domain(self, domain_str: Optional[str]) -> Optional[str]:
@@ -65,20 +71,27 @@ class SEOSuperEngineV65:
         url_clean = re.sub(r'^www\.', '', url_clean)
         return self.target_domain not in url_clean
 
-    def _strip_run_hyperlink_style(self, run_el):
-        """卸载文本节点上的超链接样式 (颜色、下划线)"""
-        rPr = run_el.find(qn('w:rPr'))
-        if rPr is not None:
-            rStyle = rPr.find(qn('w:rStyle'))
-            if rStyle is not None and rStyle.get(qn('w:val')) == 'Hyperlink':
-                rPr.remove(rStyle)
-            color = rPr.find(qn('w:color'))
-            if color is not None: rPr.remove(color)
-            u = rPr.find(qn('w:u'))
-            if u is not None: rPr.remove(u)
+    def _strip_run_hyperlink_style_robust(self, run_el: Any) -> None:
+        """
+        [Bug 2] 安全卸载文本节点上的超链接样式 (颜色、下划线)
+        Safe stripping of hyperlink styles using local-name()
+        """
+        rPrs = run_el.xpath('./*[local-name()="rPr"]')
+        if rPrs:
+            rPr = rPrs[0]
+            tags_to_remove = (
+                rPr.xpath('./*[local-name()="rStyle"]') + 
+                rPr.xpath('./*[local-name()="color"]') + 
+                rPr.xpath('./*[local-name()="u"]')
+            )
+            for tag in tags_to_remove:
+                rPr.remove(tag)
 
-    def _clean_links(self, apply_fix: bool):
-        """外链清理核心逻辑 (支持标准节点与域代码)"""
+    def _clean_links(self, apply_fix: bool) -> None:
+        """
+        外链清理核心逻辑 (支持标准节点与域代码)
+        Clean external links core logic (Supports standard nodes and field codes)
+        """
         rels = self.doc.part.rels
         links_to_remove = []
         field_codes_to_remove = []
@@ -90,7 +103,9 @@ class SEOSuperEngineV65:
                 if rId in rels and rels[rId]._target:
                     url = rels[rId]._target
                     self.all_links_found.add(url)
-                    if self._is_external(url): links_to_remove.append((hl, url))
+                    if self._is_external(url): 
+                        links_to_remove.append((hl, url))
+                        self.external_links_found += 1
                     
         # 2. 扫描域代码 (Field Codes)
         for instr in self.doc.element.xpath('.//w:instrText'):
@@ -99,10 +114,12 @@ class SEOSuperEngineV65:
                 if url_match:
                     url = url_match.group(1)
                     self.all_links_found.add(url)
-                    if self._is_external(url): field_codes_to_remove.append((instr, url))
+                    if self._is_external(url): 
+                        field_codes_to_remove.append((instr, url))
+                        self.external_links_found += 1
 
         # 3. 扫描纯文本 (仅提取，无法直接安全删除)
-        full_text = "\n".join([p.text for p in self.doc.paragraphs if p.text])
+        full_text = "\n".join(p.text for p in self.doc.paragraphs if p.text)
         for url in re.findall(r'(https?://[^\s<>"]+|www\.[^\s<>"]+)', full_text):
             self.all_links_found.add(url)
 
@@ -114,11 +131,12 @@ class SEOSuperEngineV65:
                         parent = hl.getparent()
                         if parent is not None:
                             for child in list(hl):
-                                if child.tag.endswith('}r'): self._strip_run_hyperlink_style(child)
+                                if child.tag.endswith('}r'): self._strip_run_hyperlink_style_robust(child)
                                 hl.addprevious(child)
                             parent.remove(hl)
                             self.links_removed_count += 1
-                    except: pass
+                    except Exception as e:
+                        logging.debug(f"Failed to remove hyperlink: {e}")
                 else: self.changes.append(f"待清理标准外链: {url}")
                 
             for instr, url in field_codes_to_remove:
@@ -130,10 +148,11 @@ class SEOSuperEngineV65:
                             curr = parent_r.getnext()
                             while curr is not None:
                                 if curr.xpath('.//w:fldChar[@w:fldCharType="end"]'): break
-                                if curr.tag.endswith('}r'): self._strip_run_hyperlink_style(curr)
+                                if curr.tag.endswith('}r'): self._strip_run_hyperlink_style_robust(curr)
                                 curr = curr.getnext()
                         self.links_removed_count += 1
-                    except: pass
+                    except Exception as e:
+                        logging.debug(f"Failed to remove field code link: {e}")
                 else: self.changes.append(f"待清理域代码外链: {url}")
 
     def _fix_images_and_headings(self, apply_fix: bool) -> str:
@@ -178,20 +197,53 @@ class SEOSuperEngineV65:
                 m_level = re.search(r'\d', p.style.name)
                 if m_level: headings.append((p, int(m_level.group())))
 
-        # 修复跳级
-        h_status = "正常"
-        last_lv = 0
-        for p, curr_lv in headings:
-            if last_lv > 0 and curr_lv > last_lv + 1:
-                new_lv = last_lv + 1
-                if apply_fix:
-                    pref = "Heading " if "Heading" in p.style.name else "标题 "
-                    try: p.style = f"{pref}{new_lv}"
-                    except: pass
-                h_status = f"层级跳级(H{curr_lv}->H{new_lv})"
-                self.changes.append(h_status)
-            last_lv = curr_lv
+        h_status = self._fix_heading_hierarchy(headings, apply_fix)
             
+        return h_status
+
+    def _fix_heading_hierarchy(self, headings: List[Tuple[Any, int]], apply_fix: bool) -> str:
+        """
+        [Bug 1 修复] 动态标题修复算法 (基于堆栈/基准追踪)
+        """
+        h_status = "正常"
+        last_fixed_lv = 0
+        current_offset = 0
+
+        for p, actual_lv in headings:
+            if last_fixed_lv == 0:
+                current_offset = 0
+                potential_lv = actual_lv
+            else:
+                potential_lv = actual_lv - current_offset
+                
+                if potential_lv > last_fixed_lv + 1:
+                    current_offset = actual_lv - (last_fixed_lv + 1)
+                    potential_lv = actual_lv - current_offset
+                elif potential_lv < 1:
+                    current_offset = actual_lv - 1 if actual_lv > 1 else 0
+                    potential_lv = actual_lv - current_offset
+                elif actual_lv <= last_fixed_lv and actual_lv > 1:
+                    if actual_lv <= last_fixed_lv:
+                        if actual_lv <= last_fixed_lv + 1:
+                            current_offset = 0
+                            potential_lv = actual_lv
+                        else:
+                            current_offset = actual_lv - (last_fixed_lv + 1)
+                            potential_lv = actual_lv - current_offset
+
+            if potential_lv != actual_lv:
+                h_status = "层级跳级修复"
+                old_name = p.style.name
+                if apply_fix:
+                    prefix = "Heading " if "Heading" in old_name else "标题 "
+                    try:
+                        p.style = f"{prefix}{potential_lv}"
+                    except Exception as e:
+                        logging.warning(f"Failed to apply style {prefix}{potential_lv}: {e}")
+                self.changes.append(f"层级修正: {old_name} -> H{potential_lv}")
+            
+            last_fixed_lv = potential_lv
+        
         return h_status
 
     def _check_h1_uniqueness(self) -> str:
@@ -210,17 +262,35 @@ class SEOSuperEngineV65:
     def _extract_company_info(self) -> str:
         """提取公司描述信息"""
         for p in self.doc.paragraphs:
-            full_txt = "".join([node.text for node in p._element.xpath('.//w:t') if node.text])
+            full_txt = "".join(node.text for node in p._element.xpath('.//w:t') if node.text)
             if "co., ltd" in full_txt.lower():
                 return p.text.strip()
         return "未发现"
 
     def process(self, apply_fix=False) -> Tuple[str, str, str, str, str, str]:
-        """执行单一文件的全面审计与修复"""
-        self._clean_links(apply_fix)
+        """执行单一文件的全面审计与修复 (充当调度器)"""
+        skip_rules_config = self.config.get('skip_rules_config', {})
+        file_name_lower = self.file_path.name.lower()
+        
+        skip_h1_check = False
+        skip_links_clean = False
+        
+        for rule in skip_rules_config.get('rules', []):
+            if any(kw.lower() in file_name_lower for kw in rule.get('keywords', [])):
+                checks_to_skip = rule.get('skip_checks', [])
+                if 'h1_check' in checks_to_skip: skip_h1_check = True
+                if 'links_clean' in checks_to_skip: skip_links_clean = True
+
+        if not skip_links_clean:
+            self._clean_links(apply_fix)
+            
         h_status = self._fix_images_and_headings(apply_fix)
         co_info = self._extract_company_info()
-        h1_status = self._check_h1_uniqueness() if self.config['enable_seo_check'] else "未开启检查"
+        
+        if self.config['enable_seo_check'] and not skip_h1_check:
+            h1_status = self._check_h1_uniqueness()
+        else:
+            h1_status = "未开启检查/触发跳过规则"
 
         if apply_fix and (self.changes or self.links_removed_count > 0):
             try: self.doc.save(self.file_path)
@@ -236,9 +306,9 @@ class SEOSuperEngineV65:
 # 工作流与 GUI 管理器
 # ==========================================
 class SEOWorkflowManagerV65:
-    def __init__(self):
-        self.domain_map = {}
-        self.results = []
+    def __init__(self) -> None:
+        self.domain_map: Dict[str, str] = {}
+        self.results: List[AuditResult] = []
         self.root = tk.Tk()
         self.root.title("SEO Super Engine V6.5 - 控制面板")
         self.root.geometry("480x420")
@@ -257,22 +327,23 @@ class SEOWorkflowManagerV65:
 
         ttk.Label(frame, text="⚙️ 核心任务配置", font=("微软雅黑", 12, "bold")).pack(anchor=tk.W, pady=(0, 15))
 
-        # 选框 1: 外链清理
         cb1 = ttk.Checkbutton(frame, text="开启【自动清理非本站外链】", variable=self.var_clean_links)
         cb1.pack(anchor=tk.W, pady=5)
         ttk.Label(frame, text="  (包含标准链接与隐藏域代码链接)", foreground="gray").pack(anchor=tk.W, pady=(0, 10))
 
-        # 选框 2: Webp 强制统一
         cb2 = ttk.Checkbutton(frame, text="开启【强制统一图片标注后缀为 .webp】", variable=self.var_force_webp)
         cb2.pack(anchor=tk.W, pady=5)
         ttk.Label(frame, text="  (不勾选则严格校验原后缀如 .jpg 是否与文件夹一致)", foreground="gray").pack(anchor=tk.W, pady=(0, 10))
 
-        # 选框 3: 深度 SEO 审查
         cb3 = ttk.Checkbutton(frame, text="开启【深度 SEO 内容审查】", variable=self.var_seo_check)
         cb3.pack(anchor=tk.W, pady=5)
         ttk.Label(frame, text="  (包含 H1 唯一性检查、TDK 字符长度打分评估)", foreground="gray").pack(anchor=tk.W, pady=(0, 15))
 
-        # 按钮组
+        self.var_auto_pack = tk.BooleanVar(value=True)
+        cb6 = ttk.Checkbutton(frame, text="开启【修复后自动打包】(等同于一键打包.bat)", variable=self.var_auto_pack)
+        cb6.pack(anchor=tk.W, pady=5)
+        ttk.Label(frame, text="  (自动将清理后的文档与原图提取至桌面交付文件夹)", foreground="gray").pack(anchor=tk.W, pady=(0, 15))
+
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(fill=tk.X, pady=20)
         ttk.Button(btn_frame, text="🚀 选择映射表并开始执行", command=self._start_workflow).pack(side=tk.RIGHT, padx=5)
@@ -288,13 +359,12 @@ class SEOWorkflowManagerV65:
                     fname = file_path.name.lower()
                     if fname.startswith(f"tdk-{word}") or fname == "tdk.docx":
                         doc = Document(file_path)
-                        full_txt = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+                        full_txt = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
                         
                         advice = "未开启检查"
                         if self.var_seo_check.get():
                             title_len = 0
                             desc_len = 0
-                            # 简单的正则提取打分 (容错处理)
                             t_match = re.search(r'(?i)title[:：]\s*(.*)', full_txt)
                             d_match = re.search(r'(?i)description[:：]\s*(.*)', full_txt)
                             
@@ -310,12 +380,26 @@ class SEOWorkflowManagerV65:
                             if not t_match and not d_match: advice = "⚠️ 未识别到标准 Title/Desc 标签"
                             
                         return full_txt, advice
-        except: return "读取失败", "-"
+        except Exception as e:
+            logging.debug(f"Failed to read TDK: {e}")
+            return "读取失败", "-"
         return "缺失", "-"
 
     def _start_workflow(self):
         self.run_status = True
-        self.root.destroy()
+        self.root.withdraw()
+        self.root.quit()
+
+    def _load_skip_rules_json(self, root_dir: Path) -> dict:
+        """ [Feature 3] 加载目录下的 skip_rules.json """
+        rules_path = root_dir / "skip_rules.json"
+        if rules_path.exists():
+            try:
+                with open(rules_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                logging.error(f"解析 skip_rules.json 失败: {e}")
+        return {}
 
     def run(self):
         self._build_gui()
@@ -343,55 +427,200 @@ class SEOWorkflowManagerV65:
             msg = f"⚠️ 严重警告：大半文件夹名称未在 Excel 第一列找到映射！\n例如：'{unmapped_test[0]}'\n这将导致外链清理失效。是否继续？"
             if not messagebox.askyesno("映射严重不匹配", msg): return
         
-        out_f = filedialog.asksaveasfilename(title="4. 保存报告", defaultextension=".xlsx", initialfile="SEO审计修复报告_v6.5.xlsx")
-        if not out_f: return
+        # [Feature 1] 手动选择跳过的文件
+        skipped_files_set = set()
+        if getattr(self, 'var_skip_rules', tk.BooleanVar(value=True)).get():
+            messagebox.showinfo("跳过规则", "请在接下来的窗口中，选择您想要跳过检查的 Word 文档（可多选）。\n如果不需要跳过，直接点击取消即可。")
+            skipped_paths = filedialog.askopenfilenames(
+                title="3. 选择要跳过的文档 (可按住 Ctrl/Shift 多选)",
+                initialdir=root_dir_str,
+                filetypes=[("Word Documents", "*.docx")]
+            )
+            if skipped_paths:
+                skipped_files_set = {str(Path(p).resolve()) for p in skipped_paths}
 
         config_dict = {
             'clean_links': self.var_clean_links.get(),
             'force_webp': self.var_force_webp.get(),
-            'enable_seo_check': self.var_seo_check.get()
+            'enable_seo_check': self.var_seo_check.get(),
+            'skip_rules': getattr(self, 'var_skip_rules', tk.BooleanVar(value=True)).get(),
+            'skipped_files': skipped_files_set,
+            'skip_rules_config': self._load_skip_rules_json(root_dir),
+            'dry_run': getattr(self, 'var_dry_run', tk.BooleanVar(value=False)).get(),
+            'auto_pack': getattr(self, 'var_auto_pack', tk.BooleanVar(value=True)).get()
         }
 
-        # 先审计
-        self.execute_all(root_dir, config_dict, apply_fix=False)
+        sandbox_dir = root_dir.parent / f"{root_dir.name}_Cleaned_Output"
+        sandbox_dir.mkdir(parents=True, exist_ok=True)
         
-        if messagebox.askyesno("确认修复", "初次扫描已完成！是否根据当前配置执行自动化修复？"):
-            self.results.clear()
-            self.execute_all(root_dir, config_dict, apply_fix=True)
-            messagebox.showinfo("成功", "修复完成！请查看 Excel 报告。")
+        logging.basicConfig(
+            filename=sandbox_dir / 'audit.log',
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            force=True
+        )
+        logging.info(f"Started processing. Sandbox: {sandbox_dir}")
+
+        out_f = sandbox_dir / "SEO审计修复报告_v6.5.xlsx"
+        is_dry_run = config_dict['dry_run']
+
+        self.execute_all(root_dir, sandbox_dir, config_dict, apply_fix=False)
+        
+        if not is_dry_run:
+            if messagebox.askyesno("确认修复", f"初次扫描完成！是否执行修复？\n(安全：所有文件将输出至 {sandbox_dir.name})"):
+                self.results.clear()
+                self.execute_all(root_dir, sandbox_dir, config_dict, apply_fix=True)
+                
+                if config_dict.get('auto_pack'):
+                    self._execute_packing(sandbox_dir, root_dir)
+                else:
+                    messagebox.showinfo("成功", f"修复完成！请查看沙箱目录:\n{sandbox_dir}")
+        else:
+            messagebox.showinfo("Dry-run 完成", f"仅审计模式已完成，报告生成于:\n{sandbox_dir}")
             
         pd.DataFrame([asdict(res) for res in self.results]).to_excel(out_f, index=False)
+        self.root.destroy()
 
-    def execute_all(self, root_dir: Path, config: dict, apply_fix: bool):
-        for folder_path in root_dir.iterdir():
-            if not folder_path.is_dir(): continue
+    def _execute_packing(self, cleaned_dir: Path, original_dir: Path):
+        """ [Feature 6] 替代 SEO_Packer_Pro.ps1 的内置打包功能 """
+        try:
+            timestamp = datetime.datetime.now().strftime("%m%d_%H%M")
             
-            project_name = folder_path.name
-            domain = self.domain_map.get(project_name)
-            folder_files = [f.name.lower() for f in folder_path.iterdir() if f.is_file()]
+            messagebox.showinfo("选择打包位置", "请选择最终【交付文件夹】要保存的位置。\n默认会在您选择的目录下创建一个带有时间戳的新文件夹。")
             
-            for file_path in folder_path.glob("*.docx"):
-                if file_path.name.startswith(('~', 'TDK')): continue
+            temp_root = tk.Tk()
+            temp_root.withdraw()
+            temp_root.attributes('-topmost', True)
+            
+            selected_out_dir = filedialog.askdirectory(
+                title="选择打包交付物存放目录",
+                initialdir=str(Path(os.path.expanduser("~")) / "Desktop")
+            )
+            temp_root.destroy()
+            
+            if not selected_out_dir:
+                messagebox.showwarning("已取消打包", "您取消了选择打包目录，自动打包已跳过。修复后的文件仍在沙箱中。")
+                return
                 
-                engine = SEOSuperEngineV65(file_path, domain, folder_files, config)
-                h1_status, h_status, co_info, links, miss, logs = engine.process(apply_fix=apply_fix)
-                tdk_content, tdk_advice = self.get_tdk_and_validate(folder_path, file_path.name)
+            final_delivery = Path(selected_out_dir) / f"Delivery_{timestamp}"
+            exclude_screenshot = messagebox.askyesno("打包选项", "是否排除文件名中包含 'screenshot' 的图片？")
+            
+            logging.info(f"开始打包交付物，目标路径: {final_delivery}")
+            final_delivery.mkdir(parents=True, exist_ok=True)
+            
+            # 1. 复制清理后的文档
+            for root, _, files in os.walk(cleaned_dir):
+                for file in files:
+                    # FIX: 修复了未闭合字符串，补充了 src 的声明
+                    if file.endswith('.docx') and not file.startswith('~'):
+                        src = Path(root) / file
+                        rel_path = src.relative_to(cleaned_dir)
+                        dst = final_delivery / rel_path
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src, dst)
+            
+            # 2. 复制原始资源(图片)
+            valid_exts = {'.webp', '.png', '.jpg', '.jpeg'}
+            img_count = 0
+            for root, _, files in os.walk(original_dir):
+                if cleaned_dir in Path(root).parents or Path(root) == cleaned_dir:
+                    continue
+                    
+                for file in files:
+                    ext = Path(file).suffix.lower()
+                    if ext in valid_exts:
+                        if exclude_screenshot and 'screenshot' in file.lower():
+                            continue
+                            
+                        src = Path(root) / file
+                        rel_path = src.relative_to(original_dir)
+                        dst = final_delivery / rel_path
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src, dst)
+                        img_count += 1
+            
+            messagebox.showinfo("打包成功", f"修复与打包已完成！\n\n已提取 {img_count} 张图片\n交付文件夹已生成于:\n{final_delivery}")
+        except Exception as e:
+            logging.error(f"打包过程发生错误: {e}")
+            messagebox.showerror("打包失败", f"打包过程发生错误，请查看日志:\n{e}")
+
+    def _process_single_file_task(self, file_path: Path, rel_path: Path, sandbox_dir: Path, domain: str, folder_files: List[str], config: Dict[str, Any], folder_path: Path, project_name: str, apply_fix: bool) -> Optional[AuditResult]:
+        """ [Feature 4] 单文件处理任务封装 """
+        if config.get('skip_rules') and str(file_path.resolve()) in config.get('skipped_files', set()):
+            logging.info(f"Skipped by user selection: {file_path.name}")
+            return None
+
+        out_file_path = sandbox_dir / rel_path
+        out_file_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        target_path = file_path
+        if apply_fix:
+            shutil.copy2(file_path, out_file_path)
+            target_path = out_file_path
+
+        try:
+            engine = SEOSuperEngineV65(target_path, domain, folder_files, config)
+            h1_status, h_status, co_info, links, miss, logs = engine.process(apply_fix=apply_fix)
+            tdk_content, tdk_advice = self.get_tdk_and_validate(folder_path, file_path.name)
+            
+            if getattr(engine, 'external_links_found', 0) > 0:
+                cleaned_links_count = str(engine.links_removed_count) if apply_fix else "等待修复"
+            else:
+                cleaned_links_count = "0"
+            
+            return AuditResult(
+                project_folder=project_name,
+                file_name_link=f'=HYPERLINK("{target_path}", "{file_path.name}")',
+                domain_status=domain if domain else "❌ 未匹配映射(跳过外链清理)",
+                h1_status=h1_status,
+                heading_status=h_status,
+                missing_images=miss,
+                company_info=co_info,
+                tdk_content=tdk_content,
+                tdk_advice=tdk_advice,
+                all_links=links,
+                cleaned_links_count=cleaned_links_count,
+                logs=logs
+            )
+        except Exception as e:
+            logging.error(f"Error processing {file_path.name}: {e}")
+            return None
+
+    def execute_all(self, root_dir: Path, sandbox_dir: Path, config: Dict[str, Any], apply_fix: bool) -> None:
+        """ [Bug 4] 使用 os.walk 增强目录扫描; [Feature 4] 使用 ThreadPoolExecutor 并行处理 """
+        tasks = []
+        with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
+            for root, _, files in os.walk(root_dir):
+                curr_dir = Path(root)
                 
-                res = AuditResult(
-                    project_folder=project_name,
-                    file_name_link=f'=HYPERLINK("{file_path}", "{file_path.name}")',
-                    domain_status=domain if domain else "❌ 未匹配映射(跳过外链清理)",
-                    h1_status=h1_status,
-                    heading_status=h_status,
-                    missing_images=miss,
-                    company_info=co_info,
-                    tdk_content=tdk_content,
-                    tdk_advice=tdk_advice,
-                    all_links=links,
-                    cleaned_links_count=str(engine.links_removed_count) if apply_fix else "等待修复",
-                    logs=logs
-                )
-                self.results.append(res)
+                if sandbox_dir in curr_dir.parents or curr_dir == sandbox_dir:
+                    continue
+                
+                try:
+                    rel_to_root = curr_dir.relative_to(root_dir)
+                    project_name = rel_to_root.parts[0] if rel_to_root.parts else curr_dir.name
+                except ValueError:
+                    project_name = curr_dir.name
+                    
+                domain = self.domain_map.get(project_name)
+                folder_files = [f.lower() for f in files]
+                
+                for file_name in files:
+                    if not file_name.endswith('.docx') or file_name.startswith(('~', 'TDK')): 
+                        continue
+                        
+                    file_path = curr_dir / file_name
+                    rel_path = file_path.relative_to(root_dir)
+                    
+                    tasks.append(executor.submit(
+                        self._process_single_file_task,
+                        file_path, rel_path, sandbox_dir, domain, folder_files, config, curr_dir, project_name, apply_fix
+                    ))
+            
+            for future in as_completed(tasks):
+                res = future.result()
+                if res:
+                    self.results.append(res)
 
 if __name__ == "__main__":
     SEOWorkflowManagerV65().run()
